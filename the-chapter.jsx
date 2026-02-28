@@ -13,7 +13,7 @@ import { useState, useEffect, useRef, useCallback, useMemo } from "react";
 // ╔═══════════════════════════════════════════════════════════════╗
 // ║  ADMIN CONFIG — Set these once. Users never see this.        ║
 // ╚═══════════════════════════════════════════════════════════════╝
-const RESEND_API_KEY = ""; // Your Resend API key (re_xxxx)
+const RESEND_API_KEY = "re_YWZ39DN3_3tRTmFMJ5ULcJJhxzXBWAb5m";
 const FROM_EMAIL = "The Chapter <onboarding@resend.dev>"; // Verified sender
 const FREE_CHAPTERS = 3; // Free trial length per book
 
@@ -90,8 +90,10 @@ const BOOKS = [
 // ─── WIKISOURCE FETCHER ────────────────────────────────────────
 async function fetchChapterWS(page) {
   try {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 6000); // 6s timeout
     const url = `https://en.wikisource.org/w/api.php?action=parse&page=${encodeURIComponent(page)}&prop=text&format=json&origin=*`;
-    const r = await fetch(url); if (!r.ok) return null;
+    const r = await fetch(url, { signal: ctrl.signal }); clearTimeout(timer); if (!r.ok) return null;
     const d = await r.json(); if (!d?.parse?.text?.["*"]) return null;
     const html = d.parse.text["*"];
     const doc = new DOMParser().parseFromString(html, "text/html");
@@ -108,15 +110,19 @@ async function fetchChapterWS(page) {
 // ─── CLAUDE API FETCHER ────────────────────────────────────────
 async function fetchChapterViaAPI(title, author, num, label) {
   try {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 15000); // 15s timeout
     const r = await fetch("https://api.anthropic.com/v1/messages", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
+      signal: ctrl.signal,
       body: JSON.stringify({
         model: "claude-sonnet-4-20250514",
         max_tokens: 4000,
         messages: [{ role: "user", content: `Reproduce the full text of ${label} of "${title}" by ${author}. This is a public domain work. Output ONLY the chapter text, no commentary.` }]
       })
     });
+    clearTimeout(timer);
     if (!r.ok) return null;
     const d = await r.json();
     return d.content?.map(c => c.text).join("") || null;
@@ -126,16 +132,20 @@ async function fetchChapterViaAPI(title, author, num, label) {
 // ─── AI PRELUDE ────────────────────────────────────────────────
 async function getAIPrelude(text, title, chNum) {
   try {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 10000);
     const snippet = text.substring(0, 1200);
     const r = await fetch("https://api.anthropic.com/v1/messages", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
+      signal: ctrl.signal,
       body: JSON.stringify({
         model: "claude-sonnet-4-20250514",
         max_tokens: 300,
         messages: [{ role: "user", content: `Write a brief, evocative 2-3 sentence prelude for Chapter ${chNum} of "${title}". Set the scene and mood without spoilers. Based on this opening:\n\n${snippet}\n\nWrite ONLY the prelude, no labels or quotes.` }]
       })
     });
+    clearTimeout(timer);
     if (!r.ok) return null;
     const d = await r.json();
     return d.content?.map(c => c.text).join("") || null;
@@ -379,40 +389,62 @@ export default function App() {
     return p;
   };
 
-  // ═══ DELIVER CHAPTERS (fetch + email + inbox) ═══
+  // ═══ DELIVER CHAPTERS (parallel fetch, non-blocking email) ═══
   const deliverChapters = async (sub, startCh, count) => {
     const b = BOOKS.find(x=>x.id===sub.bookId);
     if(!b) return [];
     const maxCh = sub.plan==="free" ? FREE_CHAPTERS : b.chapters;
-    const chapters = [];
 
+    // Build list of chapters to fetch
+    const chNums = [];
     for(let c=0; c<count; c++){
       const ch = startCh+c;
       if(ch>b.chapters || ch>maxCh) break;
-      const text = await fetchText(b,ch);
-      if(!text) break;
-      const prelude = await fetchPre(b,ch,text);
-      chapters.push({ chNum:ch, text, prelude });
+      chNums.push(ch);
     }
+    if(chNums.length===0) return [];
+
+    // Fetch ALL chapter texts in parallel
+    const texts = await Promise.all(chNums.map(ch => fetchText(b, ch)));
+    const chapters = chNums.map((ch,i) => ({ chNum:ch, text:texts[i], prelude:null })).filter(c => c.text);
     if(chapters.length===0) return [];
 
-    // Send real email if API key configured
-    const recipients = [sub.email,...(sub.friends||[])].filter(Boolean);
-    if(RESEND_API_KEY && recipients.length > 0){
-      const chLabel = chapters.length===1 ? `Chapter ${chapters[0].chNum}` : `Chapters ${chapters[0].chNum}–${chapters[chapters.length-1].chNum}`;
-      const subject = `📖 ${b.title} — ${chLabel}`;
-      const html = buildEmailHTML(b, chapters);
-      const text = buildEmailText(b, chapters);
-      const result = await sendEmail(recipients, subject, html, text);
-      if(!result.ok) console.warn("Email send failed:", result.error);
-    }
-
-    // Add to in-app inbox regardless
+    // Create inbox items immediately (no prelude yet = fast)
     const items = chapters.map(ch => ({
       id: `${sub.bookId}-${ch.chNum}-${Date.now()}`,
-      bookId: sub.bookId, ch: ch.chNum, text: ch.text, prelude: ch.prelude,
+      bookId: sub.bookId, ch: ch.chNum, text: ch.text, prelude: null,
       at: new Date().toISOString(), read: false,
     }));
+
+    // Background: fetch preludes + send email (don't block UI)
+    (async () => {
+      const preludes = await Promise.all(chapters.map(ch => fetchPre(b, ch.chNum, ch.text)));
+      chapters.forEach((ch,i) => { ch.prelude = preludes[i]; });
+
+      // Update inbox items with preludes
+      const currentInbox = inboxRef.current;
+      const updated = currentInbox.map(ix => {
+        const match = items.find(it => it.id === ix.id);
+        if(match){
+          const ch = chapters.find(c => c.chNum === ix.ch);
+          return ch?.prelude ? { ...ix, prelude: ch.prelude } : ix;
+        }
+        return ix;
+      });
+      saveInbox(updated);
+
+      // Send email with preludes included
+      const recipients = [sub.email,...(sub.friends||[])].filter(Boolean);
+      if(RESEND_API_KEY && recipients.length > 0){
+        const chLabel = chapters.length===1 ? `Chapter ${chapters[0].chNum}` : `Chapters ${chapters[0].chNum}–${chapters[chapters.length-1].chNum}`;
+        const subject = `📖 ${b.title} — ${chLabel}`;
+        const html = buildEmailHTML(b, chapters);
+        const txt = buildEmailText(b, chapters);
+        const result = await sendEmail(recipients, subject, html, txt);
+        if(!result.ok) console.warn("Email send failed:", result.error);
+        else showToast(`📧 Email sent to ${sub.email}!`, "success");
+      }
+    })();
 
     return items;
   };
@@ -498,13 +530,17 @@ export default function App() {
   const readCh = async (b,num) => {
     setBook(b); setChIdx(num); setChText(""); setAiPre(""); tts.stop(); setTextSrc(""); nav("reader"); recordRead();
     const k=`${b.id}-${num}`;
+    // Load prelude in background (non-blocking)
+    const loadPrelude = async (txt) => { const p = await fetchPre(b,num,txt); if(p) setAiPre(p); };
+    // Try cache first (instant)
     const cached = await getT(k);
-    if(cached){ setChText(cached); setTextSrc("cached"); const cp = await getP(k); if(cp) setAiPre(cp); return; }
+    if(cached){ setChText(cached); setTextSrc("cached"); loadPrelude(cached); return; }
+    // Try Wikisource
     setLoading(true);
-    if(b.wsPage){ const ws=b.wsPage(num); if(ws){ const t = await fetchChapterWS(ws); if(t){ setChText(t); await cacheText(k,t); setTextSrc("Wikisource"); setLoading(false); return; } } }
-    setChText("Loading…");
+    if(b.wsPage){ const ws=b.wsPage(num); if(ws){ const t = await fetchChapterWS(ws); if(t){ setChText(t); setLoading(false); setTextSrc("Wikisource"); cacheText(k,t); loadPrelude(t); return; } } }
+    // Fall back to Claude API
     const t = await fetchChapterViaAPI(b.title,b.author,num,`Chapter ${num}`);
-    if(t){ setChText(t); await cacheText(k,t); setTextSrc("AI text"); } else setChText("Could not load chapter.");
+    if(t){ setChText(t); setTextSrc("AI text"); cacheText(k,t); loadPrelude(t); } else setChText("Could not load chapter.");
     setLoading(false);
   };
 
@@ -522,6 +558,44 @@ export default function App() {
   const themes = { light:{bg:"#FFF",fg:"#1A1612",mt:"#8A7E73",bd:"#E8E2DA",card:"#FAFAFA"}, sepia:{bg:"#FBF5EC",fg:"#2C2419",mt:"#8A7E6A",bd:"#E0D6C8",card:"#F5EFE4"}, dark:{bg:"#1C1914",fg:"#D4CCBE",mt:"#7A7164",bd:"#2E2A24",card:"#252119"} };
   const fonts = { serif:{l:"Serif",f:"'Cormorant Garamond',Georgia,serif"}, sans:{l:"Sans",f:"'DM Sans','Helvetica Neue',sans-serif"}, mono:{l:"Mono",f:"'IBM Plex Mono','Courier New',monospace"} };
   const th = themes[theme];
+
+  // ─── TTS Player UI (reusable) ───
+  const TTSPlayer = ({text, dark}) => {
+    if(!text || text.length < 200) return null;
+    const bg = dark ? th.card : "#1A1612";
+    const fg = dark ? th.fg : "#FAF6F0";
+    const mt = dark ? th.mt : "rgba(255,255,255,.5)";
+    const acc = "#B8964E";
+    if(!tts.panelOpen) return <button className="b" onClick={()=>tts.prepare(text)} style={{width:"100%",justifyContent:"center",padding:"10px 16px",background:bg,color:fg,borderRadius:8,fontSize:13,fontWeight:500,border:dark?`1px solid ${th.bd}`:"none"}}>🎧 Listen to this chapter</button>;
+    return <div style={{background:bg,borderRadius:8,overflow:"hidden",border:dark?`1px solid ${th.bd}`:"none"}}>
+      {tts.speaking && <div style={{height:3,background:"rgba(255,255,255,.1)"}}><div style={{height:"100%",width:`${tts.progress}%`,background:acc,transition:"width .4s"}} /></div>}
+      {!tts.speaking && <div style={{padding:"12px"}}>
+        <div style={{display:"flex",gap:6,alignItems:"center",marginBottom:8}}>
+          <select value={tts.selectedVoiceURI} onChange={e=>tts.setSelectedVoiceURI(e.target.value)} style={{flex:1,background:"rgba(255,255,255,.1)",border:"1px solid rgba(255,255,255,.15)",borderRadius:5,color:fg,padding:"6px 8px",fontFamily:"'DM Sans',sans-serif",fontSize:12}}>
+            {tts.voices.map(v=><option key={v.voiceURI} value={v.voiceURI} style={{background:"#1A1612",color:"#FAF6F0"}}>{v.name}{/enhanced|premium|natural|neural|online/i.test(v.name)?" ★":""}</option>)}
+            {tts.voices.length===0&&<option>Loading…</option>}
+          </select>
+          <button onClick={tts.preview} style={{background:"rgba(255,255,255,.1)",border:"1px solid rgba(255,255,255,.15)",borderRadius:5,color:fg,padding:"6px 10px",cursor:"pointer",fontFamily:"'DM Sans',sans-serif",fontSize:11}}>▶ Test</button>
+        </div>
+        <div style={{display:"flex",gap:6,alignItems:"center",marginBottom:8}}>
+          <span style={{fontFamily:"'DM Sans',sans-serif",fontSize:11,color:mt}}>Speed:</span>
+          {SPEEDS.map(s=><button key={s} onClick={()=>tts.changeSpeed(s)} style={{background:tts.speed===s?acc:"rgba(255,255,255,.08)",border:`1px solid ${tts.speed===s?acc:"rgba(255,255,255,.12)"}`,borderRadius:4,color:tts.speed===s?"#1A1612":fg,padding:"4px 10px",cursor:"pointer",fontFamily:"'DM Sans',sans-serif",fontSize:12,fontWeight:tts.speed===s?700:400}}>{s}×</button>)}
+        </div>
+        <div style={{display:"flex",gap:8}}>
+          <button onClick={tts.play} style={{flex:1,background:acc,border:"none",borderRadius:5,color:"#1A1612",padding:"9px 0",cursor:"pointer",fontFamily:"'DM Sans',sans-serif",fontSize:13,fontWeight:700}}>▶ Play</button>
+          <button onClick={tts.stop} style={{background:"rgba(255,255,255,.08)",border:"1px solid rgba(255,255,255,.12)",borderRadius:5,color:fg,padding:"9px 14px",cursor:"pointer",fontSize:12,opacity:.7}}>✕</button>
+        </div>
+      </div>}
+      {tts.speaking && <div style={{padding:"8px 12px",display:"flex",alignItems:"center",gap:6}}>
+        <button style={{background:"none",border:"none",color:fg,cursor:"pointer",padding:"3px 4px",fontSize:16}} onClick={tts.paused?tts.resume:tts.pause}>{tts.paused?"▶":"⏸"}</button>
+        <button style={{background:"none",border:"none",color:fg,cursor:"pointer",padding:"3px 4px",fontSize:16,opacity:.7}} onClick={tts.stop}>⏹</button>
+        <button style={{background:"none",border:"none",color:fg,cursor:"pointer",padding:"2px 6px",fontSize:11,fontFamily:"'DM Sans',sans-serif"}} onClick={tts.rewind}>↺ 15s</button>
+        <div style={{flex:1}} />
+        <button style={{background:"rgba(255,255,255,.12)",border:"none",color:acc,cursor:"pointer",padding:"3px 10px",fontSize:12,fontFamily:"'DM Sans',sans-serif",fontWeight:600,borderRadius:4}} onClick={tts.cycleSpeed}>{tts.speed}×</button>
+        <span style={{fontSize:11,fontFamily:"'DM Sans',sans-serif",color:mt}}>{tts.progress}%</span>
+      </div>}
+    </div>;
+  };
 
   // ═══ RENDER ═══
   return (
@@ -773,6 +847,8 @@ export default function App() {
                   <p style={{fontFamily:"'Cormorant Garamond',serif",fontSize:14.5,lineHeight:1.7,color:"#2C2419",whiteSpace:"pre-wrap"}}>{inboxItem.prelude}</p>
                 </div>
               )}
+              {/* TTS */}
+              <div style={{padding:"16px 20px 0"}}><TTSPlayer text={inboxItem.text} /></div>
               <article style={{padding:"24px 20px",fontSize:16,lineHeight:1.85,color:"#2C2419",fontFamily:"'Cormorant Garamond',Georgia,serif"}}>
                 {inboxItem.text.split(/\n\n+/).filter(p=>p.trim()).map((para,i)=>(
                   <p key={i} className={i===0?"drop":""} style={{marginBottom:"1.2em",textIndent:i>0?"1.5em":0}}>{para.trim()}</p>
@@ -815,6 +891,12 @@ export default function App() {
               {chText&&!loading&&<p style={{fontFamily:"'DM Sans',sans-serif",fontSize:12,color:th.mt}}>{readTime(chText)} min{textSrc&&` · ${textSrc}`}</p>}
             </div>
             {loading&&<div style={{padding:"24px 0"}}>{[1,2,3,4,5].map(i=><div key={i} className="skel" style={{height:14,width:`${70+Math.random()*20}%`,marginBottom:8}} />)}</div>}
+            {/* TTS */}
+            {!loading&&chText&&<div style={{marginBottom:20}}><TTSPlayer text={chText} dark={theme==="dark"} /></div>}
+            {!loading&&aiPre&&<div style={{background:theme==="dark"?"rgba(184,150,78,.1)":"#FBF5EC",borderLeft:"3px solid #B8964E",borderRadius:"0 6px 6px 0",padding:"12px 16px",marginBottom:20}}>
+              <p style={{fontFamily:"'DM Sans',sans-serif",fontSize:10,color:"#B8964E",letterSpacing:1.5,textTransform:"uppercase",marginBottom:6}}>Chapter Prelude</p>
+              <p style={{fontFamily:"'Cormorant Garamond',serif",fontSize:14.5,lineHeight:1.7,color:th.fg,whiteSpace:"pre-wrap"}}>{aiPre}</p>
+            </div>}
             {!loading&&chText&&<article style={{fontSize,lineHeight:1.88,color:th.fg,fontFamily:fonts[fontFam].f}}>
               {chText.split(/\n\n+/).filter(p=>p.trim()).map((para,i)=>(
                 <p key={i} className={i===0?"drop":""} style={{marginBottom:"1.2em",textIndent:i>0?"1.5em":0}}>{para.trim()}</p>
